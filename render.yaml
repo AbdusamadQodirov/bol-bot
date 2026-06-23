@@ -1,0 +1,41 @@
+# Render.com deployment config
+# Bu Telegram bot polling rejimida ishlaydi, shuning uchun
+# Web Service EMAS, Background Worker ishlatamiz (port ochilmaydi).
+services:
+  - type: worker
+    name: bol-bot
+    runtime: docker
+    plan: starter           # yoki "free" agar mavjud bo'lsa
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: BOL_BOT_TOKEN
+        sync: false         # Render dashboard'da qo'lda kiritasiz
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FILE
+        value: ""            # Render stdout'ni o'zi yig'adi
+      - key: DB_PATH
+        value: /data/bol_bot.db
+      - key: CACHE_DIR
+        value: /data/cache
+      - key: DEFAULT_LANGUAGE
+        value: uz
+      - key: TESSERACT_LANG
+        value: eng
+      - key: ENABLE_VISION
+        value: "true"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "10"
+      - key: RATE_LIMIT_PER_DAY
+        value: "100"
+      - key: WHITELIST_MODE
+        value: "false"
+    disk:
+      name: bol-data
+      mountPath: /data
+      sizeGB: 1
