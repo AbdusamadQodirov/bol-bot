@@ -4,8 +4,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_int_csv(raw: str) -> List[int]:
+    """Parse '123,456' or '123' or '' into a list of ints."""
+    if not raw:
+        return []
+    out: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
 
 
 class Settings(BaseSettings):
@@ -39,9 +55,21 @@ class Settings(BaseSettings):
     rate_limit_per_day: int = Field(default=100, alias="RATE_LIMIT_PER_DAY")
 
     # --- access control ---
-    admin_ids: List[int] = Field(default_factory=list, alias="ADMIN_IDS")
+    # Stored as raw strings to avoid pydantic-settings' JSON-list parsing
+    # rejecting bare integers like ADMIN_IDS=2024037771.
+    admin_ids_raw: str = Field(default="", alias="ADMIN_IDS")
     whitelist_mode: bool = Field(default=False, alias="WHITELIST_MODE")
-    allowed_user_ids: List[int] = Field(default_factory=list, alias="ALLOWED_USER_IDS")
+    allowed_user_ids_raw: str = Field(default="", alias="ALLOWED_USER_IDS")
+
+    @computed_field
+    @property
+    def admin_ids(self) -> List[int]:
+        return _parse_int_csv(self.admin_ids_raw)
+
+    @computed_field
+    @property
+    def allowed_user_ids(self) -> List[int]:
+        return _parse_int_csv(self.allowed_user_ids_raw)
 
     # --- UX ---
     default_language: str = Field(default="uz", alias="DEFAULT_LANGUAGE")
@@ -53,17 +81,6 @@ class Settings(BaseSettings):
 
     # --- monitoring ---
     sentry_dsn: str = Field(default="", alias="SENTRY_DSN")
-
-    @field_validator("admin_ids", "allowed_user_ids", mode="before")
-    @classmethod
-    def _parse_int_list(cls, v):
-        if v is None or v == "":
-            return []
-        if isinstance(v, list):
-            return [int(x) for x in v]
-        if isinstance(v, str):
-            return [int(x.strip()) for x in v.split(",") if x.strip()]
-        return v
 
     def ensure_dirs(self) -> None:
         """Create data/log directories if they don't exist."""
