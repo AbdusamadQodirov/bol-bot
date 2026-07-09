@@ -84,10 +84,14 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         """Create data/log directories if they don't exist."""
-        for p in (self.db_path, self.cache_dir, self.log_file):
+        # db_path / log_file are FILE paths -> create their parent dir.
+        for p in (self.db_path, self.log_file):
             if not p:
                 continue
             Path(p).parent.mkdir(parents=True, exist_ok=True)
+        # cache_dir is a DIRECTORY itself, not a file -> create it directly.
+        if self.cache_dir:
+            Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
 
 _settings: Settings | None = None

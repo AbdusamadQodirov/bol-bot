@@ -44,6 +44,23 @@ def _db_path() -> Path:
     return Path(get_settings().db_path)
 
 
+def _utc_now_sql() -> str:
+    """UTC timestamp in SQLite's own ``datetime()`` format.
+
+    SQLite's ``datetime('now', ...)`` produces ``YYYY-MM-DD HH:MM:SS``
+    (space separator, no offset). ``datetime.isoformat()`` produces
+    ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00`` (``T`` separator). Comparing the
+    two as plain TEXT is lexicographic: at the date/time boundary, ``"T"``
+    (0x54) always sorts after ``" "`` (0x20), so any stored row from
+    *today* — no matter how many hours ago — would satisfy
+    ``ts > datetime('now', '-1 minutes')``. That silently broke both rate
+    limiting (counts became "all of today", not "last N minutes") and the
+    `/stats` "last 24h" figure. Store in SQLite's own format so the TEXT
+    comparison is actually correct.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 @contextmanager
 def _conn() -> Iterator[sqlite3.Connection]:
     path = _db_path()
@@ -87,7 +104,7 @@ def log_edit(
                     field_context, old_value, new_value, tz_from, tz_to, success)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    datetime.now(timezone.utc).isoformat(),
+                    _utc_now_sql(),
                     user_id, username, file_hash, page_index, mode,
                     field_context, old_value, new_value, tz_from, tz_to,
                     1 if success else 0,
@@ -128,7 +145,7 @@ def record_request(user_id: int) -> None:
     with _conn() as con:
         con.execute(
             "INSERT INTO rate_events(user_id, ts) VALUES (?, ?)",
-            (user_id, datetime.now(timezone.utc).isoformat()),
+            (user_id, _utc_now_sql()),
         )
         # Garbage-collect events older than 2 days
         con.execute(

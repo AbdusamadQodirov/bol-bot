@@ -26,7 +26,7 @@ from bol_bot.utils.document_scanner import preprocess_for_ocr
 
 logger = logging.getLogger(__name__)
 
-# Font preference: Liberation Sans is metric-compatible with Arial/Helvetica
+# Font preference: Liberation Sans is metric-compatible with Arial/Helvetica.
 _FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -34,14 +34,62 @@ _FONT_CANDIDATES = (
     "C:/Windows/Fonts/Arial.ttf",
 )
 
+# Many BOL/ticket forms (older dot-matrix printers, POS/route tickets like
+# USPS PS Form 5398-A) use a monospaced typewriter-style font instead of a
+# proportional one. Liberation Mono is metric-compatible with Courier New.
+_MONO_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "C:/Windows/Fonts/consola.ttf",
+    "C:/Windows/Fonts/cour.ttf",
+)
 
-def _load_bol_font(fontsize: int) -> "ImageFont.FreeTypeFont":
-    for path in _FONT_CANDIDATES:
+
+def _load_font_family(paths: Tuple[str, ...], fontsize: int) -> "ImageFont.FreeTypeFont":
+    for path in paths:
         try:
             return ImageFont.truetype(path, fontsize)
         except Exception:
             continue
     return ImageFont.load_default()
+
+
+def _load_bol_font(fontsize: int) -> "ImageFont.FreeTypeFont":
+    return _load_font_family(_FONT_CANDIDATES, fontsize)
+
+
+def _text_width(font: "ImageFont.FreeTypeFont", text: str) -> float:
+    try:
+        return font.getlength(text)
+    except AttributeError:  # pragma: no cover - old Pillow fallback
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0]
+
+
+def _best_matching_font(
+    text: str, fontsize: int, target_width: float
+) -> "ImageFont.FreeTypeFont":
+    """Pick proportional vs. monospace font, whichever renders ``text`` at
+    ``fontsize`` closest to ``target_width`` (the ORIGINAL matched text's
+    measured pixel width).
+
+    We have no way to read the source document's actual embedded/printed
+    font, so this uses rendered width as a proxy: a monospace font and a
+    proportional font produce visibly different widths for the same
+    string, and picking the closer one measurably improves visual match
+    (spacing/density) instead of always defaulting to a sans-serif font
+    that can look clearly out of place on dot-matrix-style forms.
+    """
+    proportional = _load_bol_font(fontsize)
+    if not text or target_width <= 0:
+        return proportional
+    mono = _load_font_family(_MONO_FONT_CANDIDATES, fontsize)
+    best_font, best_diff = proportional, None
+    for font in (proportional, mono):
+        diff = abs(_text_width(font, text) - target_width)
+        if best_diff is None or diff < best_diff:
+            best_font, best_diff = font, diff
+    return best_font
 
 
 @dataclass
@@ -113,6 +161,23 @@ def _measure_fontsize(rect: "fitz.Rect") -> float:
     return max(6.0, min(14.0, raw))
 
 
+def _best_matching_fontname(text: str, fontsize: float, target_width: float) -> str:
+    """Pick "helv" (proportional) vs "cour" (monospace) — both built into
+    PyMuPDF, no font file needed — whichever renders ``text`` closest to
+    ``target_width``. Same width-matching idea as ``_best_matching_font``,
+    for the vector text-PDF path.
+    """
+    if not text or target_width <= 0:
+        return "helv"
+    best_name, best_diff = "helv", None
+    for name in ("helv", "cour"):
+        w = fitz.get_text_length(text, fontname=name, fontsize=fontsize)
+        diff = abs(w - target_width)
+        if best_diff is None or diff < best_diff:
+            best_name, best_diff = name, diff
+    return best_name
+
+
 def replace_text_in_pdf(
     doc: "fitz.Document", candidate: PageCandidate, new_text: str
 ) -> None:
@@ -123,11 +188,12 @@ def replace_text_in_pdf(
     page.apply_redactions()
     for rect in rect_list:
         fontsize = _measure_fontsize(rect)
+        fontname = _best_matching_fontname(new_text, fontsize, rect.width)
         page.insert_text(
             (rect.x0, rect.y1 - rect.height * 0.22),
             new_text,
             fontsize=fontsize,
-            fontname="helv",
+            fontname=fontname,
             color=(0, 0, 0),
         )
 
@@ -161,18 +227,28 @@ def extract_ocr_candidates(
             config="--oem 3 --psm 6",
         )
         words = ocr_data["text"]
-        full_text = " ".join(w for w in words if w.strip())
-        candidates = find_datetime_candidates(full_text)
-        if not candidates:
-            continue
-
         n = len(words)
         word_boxes = [
             (words[i], ocr_data["left"][i], ocr_data["top"][i],
              ocr_data["width"][i], ocr_data["height"][i])
             for i in range(n) if words[i].strip()
         ]
+
+        # Tesseract's own block/paragraph/line grouping under --psm 6
+        # assumes a single uniform block of text. On dense multi-column
+        # BOL/ticket forms (label table on the left, another table on the
+        # right at the same row height) this routinely bleeds across
+        # columns and produces a scrambled reading order — words from
+        # unrelated, far-apart fields end up adjacent in ``full_text``.
+        # Re-derive top-to-bottom / left-to-right order directly from each
+        # word's own pixel position instead of trusting that order.
+        word_boxes = _sort_words_reading_order(word_boxes)
         clean_words = [w[0] for w in word_boxes]
+        full_text = " ".join(clean_words)
+
+        candidates = find_datetime_candidates(full_text)
+        if not candidates:
+            continue
 
         # Map each word's index to its character offset in ``full_text`` so
         # that a candidate's ``tm.start`` can be matched to the OCR word it
@@ -203,6 +279,43 @@ def extract_ocr_candidates(
             ))
 
     return results, page_images
+
+
+def _sort_words_reading_order(
+    word_boxes: List[Tuple[str, int, int, int, int]],
+) -> List[Tuple[str, int, int, int, int]]:
+    """Re-order OCR word boxes into true top-to-bottom, left-to-right order.
+
+    Each box is ``(text, left, top, width, height)``. Words are clustered
+    into rows by vertical-center proximity (not by Tesseract's block/line
+    numbers, which can be wrong on multi-column layouts), then each row is
+    sorted left-to-right and rows are sorted top-to-bottom.
+    """
+    if not word_boxes:
+        return []
+
+    rows: List[dict] = []
+    for wb in sorted(word_boxes, key=lambda b: b[2]):  # by top, coarse pass
+        _, _left, top, _width, height = wb
+        cy = top + height / 2
+        best_row = None
+        for row in rows:
+            if abs(cy - row["cy"]) <= max(height, row["height"]) * 0.6:
+                best_row = row
+                break
+        if best_row is None:
+            rows.append({"boxes": [wb], "cy": cy, "height": height})
+        else:
+            best_row["boxes"].append(wb)
+            cnt = len(best_row["boxes"])
+            best_row["cy"] = (best_row["cy"] * (cnt - 1) + cy) / cnt
+            best_row["height"] = max(best_row["height"], height)
+
+    rows.sort(key=lambda r: r["cy"])
+    out: List[Tuple[str, int, int, int, int]] = []
+    for row in rows:
+        out.extend(sorted(row["boxes"], key=lambda b: b[1]))
+    return out
 
 
 def _word_index_for_char_offset(word_char_starts: List[int], char_offset: int) -> int:
@@ -267,8 +380,9 @@ def replace_text_in_scanned_pdf(
     y1 = max(r.y1 for r in candidate.rects)
     draw.rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2], fill="white")
     height = y1 - y0
+    width = x1 - x0
     fontsize = max(10, int(height * 0.85))
-    font = _load_bol_font(fontsize)
+    font = _best_matching_font(new_text, fontsize, width)
     draw.text((x0, y0), new_text, fill="black", font=font)
 
 
@@ -327,6 +441,7 @@ def replace_vision_candidate_in_image(
     x0, y0, x1, y1 = candidate_to_pixel_rect(vision_candidate, w, h)
     draw.rectangle([x0, y0, x1, y1], fill="white")
     box_height = y1 - y0
+    box_width = x1 - x0
     fontsize = max(10, int(box_height * 0.78))
-    font = _load_bol_font(fontsize)
+    font = _best_matching_font(new_text, fontsize, box_width)
     draw.text((x0 + 2, y0 + (box_height * 0.08)), new_text, fill="black", font=font)
