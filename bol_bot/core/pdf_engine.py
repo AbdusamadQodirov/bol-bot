@@ -84,9 +84,19 @@ def extract_text_candidates(doc: "fitz.Document") -> List[PageCandidate]:
     for page_idx, page in enumerate(doc):
         full_text = page.get_text("text")
         for tm in find_datetime_candidates(full_text):
-            rects = page.search_for(tm.raw_text)
-            if not rects:
+            all_rects = page.search_for(tm.raw_text)
+            if not all_rects:
                 continue
+            # ``search_for`` returns EVERY occurrence of this exact string
+            # on the page, in the same top-to-bottom/left-to-right order
+            # the text scan encounters them. When the same date/time text
+            # is printed under two different labels (e.g. a "Ship Date"
+            # that happens to match a "Signature Date"), we must pick only
+            # the rect for THIS occurrence — otherwise every occurrence on
+            # the page gets overwritten with the new value.
+            occurrence_index = full_text.count(tm.raw_text, 0, tm.start)
+            occurrence_index = min(occurrence_index, len(all_rects) - 1)
+            rects = [all_rects[occurrence_index]]
             ctx = _get_context(full_text, tm.start, tm.end)
             results.append(PageCandidate(
                 page_index=page_idx, tm=tm, rects=rects, context=ctx, is_scanned=False
@@ -164,9 +174,22 @@ def extract_ocr_candidates(
         ]
         clean_words = [w[0] for w in word_boxes]
 
+        # Map each word's index to its character offset in ``full_text`` so
+        # that a candidate's ``tm.start`` can be matched to the OCR word it
+        # actually came from. Without this, a raw_text that repeats
+        # elsewhere on the page (e.g. the same date/time printed in two
+        # fields) would always resolve to the FIRST occurrence, silently
+        # overwriting the wrong field.
+        word_char_starts = []
+        pos = 0
+        for w in clean_words:
+            word_char_starts.append(pos)
+            pos += len(w) + 1
+
         for tm in candidates:
             target_words = tm.raw_text.split()
-            match_start = _find_word_sequence(clean_words, target_words)
+            expected_index = _word_index_for_char_offset(word_char_starts, tm.start)
+            match_start = _find_word_sequence(clean_words, target_words, expected_index)
             if match_start is None:
                 continue
             boxes = word_boxes[match_start : match_start + len(target_words)]
@@ -182,15 +205,49 @@ def extract_ocr_candidates(
     return results, page_images
 
 
-def _find_word_sequence(haystack: List[str], needle: List[str]) -> Optional[int]:
+def _word_index_for_char_offset(word_char_starts: List[int], char_offset: int) -> int:
+    """Return the index of the OCR word that contains ``char_offset``.
+
+    ``word_char_starts[i]`` is where word ``i`` begins in the joined
+    ``full_text`` string. Finds the last word starting at or before the
+    offset.
+    """
+    lo, hi = 0, len(word_char_starts) - 1
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if word_char_starts[mid] <= char_offset:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _find_word_sequence(
+    haystack: List[str], needle: List[str], expected_index: Optional[int] = None
+) -> Optional[int]:
+    """Find where ``needle`` occurs in ``haystack``.
+
+    ``needle`` (the matched raw_text) can occur more than once on a page —
+    e.g. the same date/time printed under two different labels. When that
+    happens, pick the occurrence closest to ``expected_index`` (the word
+    position the candidate was actually detected at) instead of always the
+    first one, otherwise the wrong field gets overwritten.
+    """
     def norm(w: str) -> str:
         return w.strip().strip(",.").lower()
     needle_n = [norm(w) for w in needle]
     hl, nl = len(haystack), len(needle_n)
-    for i in range(hl - nl + 1):
-        if [norm(haystack[i + j]) for j in range(nl)] == needle_n:
-            return i
-    return None
+    matches = [
+        i for i in range(hl - nl + 1)
+        if [norm(haystack[i + j]) for j in range(nl)] == needle_n
+    ]
+    if not matches:
+        return None
+    if expected_index is None:
+        return matches[0]
+    return min(matches, key=lambda i: abs(i - expected_index))
 
 
 def replace_text_in_scanned_pdf(
