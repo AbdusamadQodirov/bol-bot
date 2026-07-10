@@ -389,3 +389,64 @@ def format_like_original(dt: datetime, tm: TimeMatch) -> str:
 
 def looks_like_amazon(full_text: str) -> bool:
     return bool(re.search(r'\bamazon\b', full_text, re.IGNORECASE))
+
+
+# ---------------------------------------------------------------------------
+# Same-value matching across fields
+# ---------------------------------------------------------------------------
+# BOL forms routinely print the SAME moment under several labels — e.g. on a
+# PS Form 5398-A the Actual Dep., Time Sealed and Date fields all carry
+# "06/24 19:39" (the Date one with a year). When the user edits one of them,
+# the others must move with it or the document contradicts itself.
+
+_VALUE_TIME_RE = re.compile(
+    r'(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp]\.?[Mm]\.?)?'
+)
+_VALUE_DATE_RE = re.compile(r'(?<!\d)(\d{1,2})[/\-](\d{1,2})(?:[/\-]\d{2,4})?(?!\d)')
+
+
+def extract_time_hm(raw: str) -> Optional[tuple]:
+    """Pull the first HH:MM out of a raw field value, normalised to 24h."""
+    m = _VALUE_TIME_RE.search(raw or "")
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    ampm = (m.group(3) or "").lower().replace(".", "")
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    return (hour, minute)
+
+
+def extract_date_md(raw: str) -> Optional[tuple]:
+    """Pull the first plausible MM/DD (year optional) out of a raw value."""
+    for m in _VALUE_DATE_RE.finditer(raw or ""):
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return (month, day)
+    return None
+
+
+def matches_datetime_value(chosen_raw: str, other_raw: str) -> bool:
+    """True if ``other_raw`` denotes the same moment as ``chosen_raw``.
+
+    Times must be equal; dates must be equal when both values carry one.
+    A value missing its date (bare "19:39") still matches a dated twin
+    ("06/24 19:39", "06/24/2026 19:39"). A date-only value only matches
+    other date-only values — sharing a date with a timed field does NOT
+    mean they are the same moment.
+    """
+    chosen_t, chosen_d = extract_time_hm(chosen_raw), extract_date_md(chosen_raw)
+    other_t, other_d = extract_time_hm(other_raw), extract_date_md(other_raw)
+    if chosen_t is None and chosen_d is None:
+        return False
+    if chosen_t is not None:
+        if other_t != chosen_t:
+            return False
+        if chosen_d is not None and other_d is not None and chosen_d != other_d:
+            return False
+        return True
+    return other_t is None and other_d is not None and other_d == chosen_d

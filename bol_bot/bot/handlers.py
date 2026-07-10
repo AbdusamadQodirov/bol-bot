@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Optional
 
@@ -37,6 +37,7 @@ from bol_bot.storage import log_edit
 from bol_bot.utils.datetime_utils import (
     format_like_original, looks_like_pickup_group_label,
     looks_like_time_in_label, looks_like_time_out_label,
+    matches_datetime_value,
 )
 from bol_bot.utils.document_scanner import auto_crop_document, auto_rotate_document
 from bol_bot.utils.timezone_utils import (
@@ -201,12 +202,19 @@ async def _process_scanned_pdf(update: Update, ctx, doc):
 
     settings = get_settings()
     vision_candidates = []
-    if not ocr_candidates and settings.enable_vision:
+    # Claude vision reads photographed forms far more reliably than
+    # Tesseract (which garbles dot-matrix type and misses whole fields), so
+    # on single-page documents it is tried FIRST; OCR candidates are the
+    # fallback. Multi-page documents keep OCR-first because vision only
+    # sees page 1.
+    if settings.enable_vision and (len(page_images) == 1 or not ocr_candidates):
         try:
-            # Use the first page for vision; multi-page vision could be added later
             vision_candidates = find_vision_candidates(page_images[0])
         except RuntimeError as e:
-            await update.message.reply_text(t(_lang(ctx), "vision_error", err=str(e)))
+            if not ocr_candidates:
+                await update.message.reply_text(
+                    t(_lang(ctx), "vision_error", err=str(e))
+                )
 
     if vision_candidates:
         ctx.user_data["mode"] = "vision"
@@ -434,7 +442,9 @@ async def receive_new_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             t(_lang(ctx), "btn_confirm_delta"), callback_data="confirm_yes_delta",
         )])
 
-    group = _find_pickup_group(ctx)
+    group = _find_same_value_group(ctx)
+    seen = {j for j, _, _ in group}
+    group += [g for g in _find_pickup_group(ctx) if g[0] not in seen]
     extra_note = ""
     if group:
         ctx.user_data["pickup_group"] = group
@@ -497,6 +507,29 @@ def _find_paired_in_candidate(ctx):
         if old_in:
             return (j, old_out - old_in, old_in_raw)
     return None
+
+
+def _find_same_value_group(ctx):
+    """Other candidates carrying the SAME moment as the chosen one.
+
+    BOL forms print one event under several labels (Dep. / Time Sealed /
+    Date all showing "06/24 19:39"); leaving the twins untouched while one
+    changes makes the document contradict itself. Entries use delta=0 so
+    the confirm-group path rewrites each twin to the same new datetime,
+    format-preserved per field (a twin with a year keeps its year).
+    """
+    mode = ctx.user_data["mode"]
+    idx = ctx.user_data["chosen_idx"]
+    all_ = _all_candidates(ctx)
+    chosen_raw = _candidate_raw(all_[idx], mode)
+    out = []
+    for j, other in enumerate(all_):
+        if j == idx:
+            continue
+        other_raw = _candidate_raw(other, mode)
+        if matches_datetime_value(chosen_raw, other_raw):
+            out.append((j, timedelta(0), other_raw))
+    return out
 
 
 def _find_pickup_group(ctx):
@@ -591,7 +624,9 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     other = ctx.user_data["vision_candidates"][j]
                     new_other = format_like_vision_text(old_raw, new_dt + delta)
                     replace_vision_candidate_in_image(page_img, other, new_other)
-            out = images_to_pdf_bytes([page_img])
+            # page_img IS page_images[0] (mutated in place) — emit every
+            # page so multi-page documents don't lose their tail pages.
+            out = images_to_pdf_bytes(ctx.user_data.get("page_images") or [page_img])
     except Exception as e:
         logger.exception("edit_failed")
         await q.message.reply_text(f"Xatolik: {e}")

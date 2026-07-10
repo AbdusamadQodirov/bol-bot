@@ -18,11 +18,19 @@ def format_like_vision_text(old_raw: str, new_dt: datetime) -> str:
 
     date_m = re.search(r'(\d{1,2})([/\-])(\d{1,2})[/\-](\d{2,4})', old_raw)
     date_mon_m = None
+    date_md_m = None
     if not date_m:
         date_mon_m = re.search(
             r'(\d{1,2})-(' + '|'.join(_MONTHS_SHORT) + r')-(\d{2,4})',
             old_raw, re.IGNORECASE,
         )
+        if not date_mon_m:
+            # Year-less MM/DD ("06/24 19:39") — the usual shape on route
+            # tickets like PS Form 5398-A. The ':' guards keep the dash of
+            # a time range ("06:00-10:00") from parsing as a date.
+            date_md_m = re.search(
+                r'(?<![\d:])(\d{1,2})([/\-])(\d{1,2})(?![\d:])', old_raw
+            )
     range_m = re.search(r'(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})', old_raw)
 
     def date_part() -> str:
@@ -30,6 +38,9 @@ def format_like_vision_text(old_raw: str, new_dt: datetime) -> str:
             year_len = len(date_mon_m.group(3))
             year_str = str(new_dt.year) if year_len == 4 else str(new_dt.year)[-2:]
             return f"{new_dt.day}-{_MONTHS_SHORT[new_dt.month - 1]}-{year_str}"
+        if date_md_m:
+            sep = date_md_m.group(2)
+            return f"{new_dt.month:02d}{sep}{new_dt.day:02d}"
         if not date_m:
             return ""
         sep = date_m.group(2)
@@ -37,7 +48,7 @@ def format_like_vision_text(old_raw: str, new_dt: datetime) -> str:
         year_str = str(new_dt.year) if year_len == 4 else str(new_dt.year)[-2:]
         return f"{new_dt.month:02d}{sep}{new_dt.day:02d}{sep}{year_str}"
 
-    date_present = bool(date_m or date_mon_m)
+    date_present = bool(date_m or date_mon_m or date_md_m)
 
     if range_m:
         sh, sm, eh, em = (int(g) for g in range_m.groups())

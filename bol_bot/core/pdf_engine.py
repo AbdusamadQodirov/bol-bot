@@ -44,6 +44,18 @@ _MONO_FONT_CANDIDATES = (
     "C:/Windows/Fonts/cour.ttf",
 )
 
+_SANS_BOLD_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+)
+_MONO_BOLD_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "C:/Windows/Fonts/consolab.ttf",
+    "C:/Windows/Fonts/courbd.ttf",
+)
+
 
 def _load_font_family(paths: Tuple[str, ...], fontsize: int) -> "ImageFont.FreeTypeFont":
     for path in paths:
@@ -66,30 +78,159 @@ def _text_width(font: "ImageFont.FreeTypeFont", text: str) -> float:
         return bbox[2] - bbox[0]
 
 
-def _best_matching_font(
-    text: str, fontsize: int, target_width: float
+def _fit_font_to_box(
+    paths: Tuple[str, ...], text: str, box_width: float, box_height: float
 ) -> "ImageFont.FreeTypeFont":
-    """Pick proportional vs. monospace font, whichever renders ``text`` at
-    ``fontsize`` closest to ``target_width`` (the ORIGINAL matched text's
-    measured pixel width).
+    """Load the first available font from ``paths`` at the point size whose
+    RENDERED glyph height fills ``box_height``.
 
-    We have no way to read the source document's actual embedded/printed
-    font, so this uses rendered width as a proxy: a monospace font and a
-    proportional font produce visibly different widths for the same
-    string, and picking the closer one measurably improves visual match
-    (spacing/density) instead of always defaulting to a sans-serif font
-    that can look clearly out of place on dot-matrix-style forms.
+    A TrueType nominal point size includes ascender/descender headroom, so
+    text drawn at ``fontsize == box_height`` comes out visibly smaller than
+    the original ink it replaces. Measure the actual glyph bbox at a
+    reference size and scale, capping so the string can't overflow the
+    table cell horizontally by more than ~15%.
     """
-    proportional = _load_bol_font(fontsize)
-    if not text or target_width <= 0:
-        return proportional
-    mono = _load_font_family(_MONO_FONT_CANDIDATES, fontsize)
-    best_font, best_diff = proportional, None
-    for font in (proportional, mono):
-        diff = abs(_text_width(font, text) - target_width)
-        if best_diff is None or diff < best_diff:
-            best_font, best_diff = font, diff
-    return best_font
+    ref = 100
+    font = _load_font_family(paths, ref)
+    if not text or not hasattr(font, "getbbox"):
+        return font
+    bbox = font.getbbox(text)
+    glyph_h = bbox[3] - bbox[1]
+    glyph_w = bbox[2] - bbox[0]
+    if glyph_h <= 0 or glyph_w <= 0:
+        return font
+    size = ref * box_height / glyph_h
+    if box_width > 0:
+        size = min(size, ref * (box_width * 1.15) / glyph_w)
+    return _load_font_family(paths, max(8, int(round(size))))
+
+
+def _ink_ratio(gray: Image.Image) -> float:
+    """Fraction of dark (< 128) pixels — a proxy for stroke weight."""
+    hist = gray.histogram()
+    total = sum(hist)
+    return sum(hist[:128]) / total if total else 0.0
+
+
+def _rendered_ink_ratio(font: "ImageFont.FreeTypeFont", text: str) -> float:
+    bbox = font.getbbox(text)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if w <= 0 or h <= 0:
+        return 0.0
+    from PIL import ImageDraw
+
+    canvas = Image.new("L", (w, h), 255)
+    ImageDraw.Draw(canvas).text((-bbox[0], -bbox[1]), text, fill=0, font=font)
+    return _ink_ratio(canvas)
+
+
+def _pick_replacement_font(
+    img: Image.Image,
+    box: Tuple[int, int, int, int],
+    new_text: str,
+    old_text: str = "",
+    mono_hint: Optional[bool] = None,
+) -> "ImageFont.FreeTypeFont":
+    """Choose the font that best matches the ORIGINAL ink inside ``box``.
+
+    Family (mono vs. proportional): ``mono_hint`` (Claude's judgement of
+    the print style) wins when available, because the width heuristic
+    flip-flops with a few pixels of bbox noise and then the same value
+    gets two different fonts in one document. Without a hint, pick the
+    family that renders ``old_text`` (the string actually occupying the
+    box) at a width closest to the box. Weight (regular vs. bold) is
+    picked by which one's rendered ink density is closest to the original
+    crop's — dot-matrix/typewriter BOL forms print heavy strokes that a
+    regular font visibly fails to match.
+    """
+    x0, y0, x1, y1 = box
+    box_w, box_h = x1 - x0, y1 - y0
+    # Detected boxes carry a little padding around the glyphs.
+    target_h = box_h * 0.88
+
+    regular = (_FONT_CANDIDATES, _MONO_FONT_CANDIDATES)
+    bold = (_SANS_BOLD_FONT_CANDIDATES, _MONO_BOLD_FONT_CANDIDATES)
+    if mono_hint is not None:
+        fam = 1 if mono_hint else 0
+    else:
+        ref_text = old_text or new_text
+        fitted = [_fit_font_to_box(p, ref_text, box_w, target_h) for p in regular]
+        diffs = [abs(_text_width(f, ref_text) - box_w) for f in fitted]
+        # Prefer mono on a near-tie: these forms are usually typewriter print.
+        fam = 1 if diffs[1] <= diffs[0] * 1.15 else 0
+
+    orig_ink = _ink_ratio(img.crop((x0, y0, x1, y1)).convert("L"))
+    candidates = [
+        _fit_font_to_box(regular[fam], new_text, box_w, target_h),
+        _fit_font_to_box(bold[fam], new_text, box_w, target_h),
+    ]
+    return min(
+        candidates,
+        key=lambda f: abs(_rendered_ink_ratio(f, new_text) - orig_ink),
+    )
+
+
+def _grow_whiteout_x(
+    img: Image.Image, x0: int, y0: int, x1: int, y1: int
+) -> Tuple[int, int]:
+    """Stretch the white-out sideways over glyph fragments of the ORIGINAL
+    value that stick out past the detected box (bbox noise), so no stray
+    half-digits survive the edit. Growth stops at table borders (columns
+    dark across nearly the full band height), across gaps wider than a
+    character space, and after 20% of the box width on each side.
+    """
+    band_h = y1 - y0
+    if band_h <= 0:
+        return x0, x1
+    max_grow = max(4, (x1 - x0) // 5)
+    max_gap = max(3, int(band_h * 0.6))
+
+    def dark_frac(x: int) -> float:
+        col = img.crop((x, y0, x + 1, y1)).convert("L")
+        return sum(col.histogram()[:128]) / band_h
+
+    def grow(start: int, step: int) -> int:
+        grown, gap, cur = start, 0, start
+        for _ in range(max_grow):
+            nxt = cur + step
+            if nxt < 0 or nxt >= img.width:
+                break
+            frac = dark_frac(nxt)
+            if frac > 0.9:  # table border — never erase it
+                break
+            if frac >= 0.05:
+                grown, gap = nxt, 0
+            else:
+                gap += 1
+                if gap > max_gap:
+                    break
+            cur = nxt
+        return grown
+
+    return grow(x0, -1), grow(x1 - 1, +1) + 1
+
+
+def _draw_replacement(
+    img: Image.Image,
+    box: Tuple[int, int, int, int],
+    new_text: str,
+    old_text: str = "",
+    mono_hint: Optional[bool] = None,
+) -> None:
+    """White-out ``box`` and draw ``new_text`` sized, weighted and aligned
+    to match the original ink as closely as possible."""
+    from PIL import ImageDraw
+
+    x0, y0, x1, y1 = box
+    font = _pick_replacement_font(img, box, new_text, old_text, mono_hint)
+    wx0, wx1 = _grow_whiteout_x(img, x0, y0, x1, y1)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([wx0 - 2, y0 - 2, wx1 + 2, y1 + 2], fill="white")
+    bbox = font.getbbox(new_text)
+    glyph_h = bbox[3] - bbox[1]
+    tx = x0 - bbox[0]
+    ty = y0 + ((y1 - y0) - glyph_h) / 2 - bbox[1]
+    draw.text((tx, ty), new_text, fill="black", font=font)
 
 
 @dataclass
@@ -368,22 +509,17 @@ def replace_text_in_scanned_pdf(
     candidate: PageCandidate,
     new_text: str,
 ) -> None:
-    from PIL import ImageDraw
-
     img = page_images[candidate.page_index]
-    draw = ImageDraw.Draw(img)
     if not candidate.rects:
         return
     x0 = min(r.x0 for r in candidate.rects)
     y0 = min(r.y0 for r in candidate.rects)
     x1 = max(r.x1 for r in candidate.rects)
     y1 = max(r.y1 for r in candidate.rects)
-    draw.rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2], fill="white")
-    height = y1 - y0
-    width = x1 - x0
-    fontsize = max(10, int(height * 0.85))
-    font = _best_matching_font(new_text, fontsize, width)
-    draw.text((x0, y0), new_text, fill="black", font=font)
+    _draw_replacement(
+        img, (int(x0), int(y0), int(x1), int(y1)), new_text,
+        old_text=candidate.tm.raw_text,
+    )
 
 
 def images_to_pdf_bytes(page_images: List[Image.Image]) -> bytes:
@@ -432,16 +568,12 @@ def draw_numbered_overlay(img: Image.Image, vision_candidates: list) -> Image.Im
 def replace_vision_candidate_in_image(
     img: Image.Image, vision_candidate, new_text: str
 ) -> None:
-    from PIL import ImageDraw
-
     from bol_bot.core.vision_engine import candidate_to_pixel_rect
 
-    draw = ImageDraw.Draw(img)
     w, h = img.size
-    x0, y0, x1, y1 = candidate_to_pixel_rect(vision_candidate, w, h)
-    draw.rectangle([x0, y0, x1, y1], fill="white")
-    box_height = y1 - y0
-    box_width = x1 - x0
-    fontsize = max(10, int(box_height * 0.78))
-    font = _best_matching_font(new_text, fontsize, box_width)
-    draw.text((x0 + 2, y0 + (box_height * 0.08)), new_text, fill="black", font=font)
+    box = candidate_to_pixel_rect(vision_candidate, w, h)
+    _draw_replacement(
+        img, box, new_text,
+        old_text=vision_candidate.raw_text,
+        mono_hint=getattr(vision_candidate, "is_monospace", None),
+    )

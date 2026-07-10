@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
@@ -39,6 +39,9 @@ class VisionCandidate:
     x1: int
     y1: int
     confidence: float = 1.0  # 0..1
+    # True for typewriter/dot-matrix print, False for proportional print,
+    # None when Claude didn't say — used to pick the replacement font family.
+    is_monospace: Optional[bool] = None
 
     def as_dict(self) -> dict:
         return {
@@ -47,6 +50,7 @@ class VisionCandidate:
             "is_handwritten": self.is_handwritten,
             "bbox": [self.x0, self.y0, self.x1, self.y1],
             "confidence": self.confidence,
+            "is_monospace": self.is_monospace,
         }
 
 
@@ -56,6 +60,7 @@ Return a JSON array. Each element is one date/time value that appears in the doc
 - "raw_text": the EXACT text as written (preserve spelling, punctuation, case)
 - "context":  the nearby label / field name (e.g. "Ship Date", "Time In", "Pickup", "Shipper Signature Date", "Origin")
 - "is_handwritten": true if the value looks hand-written, false if it's printed/typed
+- "is_monospace": true if the value is printed in a typewriter/dot-matrix/monospaced font (all characters equal width), false if it's a proportional font
 - "bbox": [x0, y0, x1, y1] — TIGHT bounding box around ONLY the value (not the label), as integers in 0..1000 coordinate space (top-left origin, x right, y down)
 - "confidence": float 0..1 (your confidence this is a real date/time field)
 
@@ -63,9 +68,10 @@ Rules:
 - Include BOTH printed and handwritten dates/times
 - Include time ranges like "06:00-10:00" as a single field
 - Include date+time pairs like "6/19/2026 14:30" as a single field
+- If the SAME date/time value is printed in several fields (e.g. Dep., Time Sealed and Date all showing "06/24 19:39"), return EVERY occurrence as its own element
 - Exclude: phone numbers, zip codes, PO numbers, document IDs, barcodes
 - Exclude: dates clearly belonging to delivery / destination unless they are the only ones
-- Make the bbox AS TIGHT AS POSSIBLE around the value — this is critical: we will OVERWRITE the box
+- The bbox must cover the ENTIRE value (every character, including the date part of a date+time pair) but stay AS TIGHT AS POSSIBLE around it — this is critical: we will OVERWRITE the box
 
 Return ONLY the JSON array, no prose, no markdown fence."""
 
@@ -168,6 +174,7 @@ def find_vision_candidates(img: Image.Image) -> List[VisionCandidate]:
             y1 = max(0, min(1000, y1))
             if x1 <= x0 or y1 <= y0:
                 continue
+            mono = it.get("is_monospace")
             out.append(
                 VisionCandidate(
                     raw_text=str(it.get("raw_text", "")).strip(),
@@ -175,6 +182,7 @@ def find_vision_candidates(img: Image.Image) -> List[VisionCandidate]:
                     is_handwritten=bool(it.get("is_handwritten", False)),
                     x0=x0, y0=y0, x1=x1, y1=y1,
                     confidence=float(it.get("confidence", 1.0)),
+                    is_monospace=bool(mono) if mono is not None else None,
                 )
             )
         except (TypeError, ValueError) as e:

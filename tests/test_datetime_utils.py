@@ -4,11 +4,14 @@ from datetime import datetime
 import pytest
 
 from bol_bot.utils.datetime_utils import (
+    extract_date_md,
+    extract_time_hm,
     find_datetime_candidates,
     format_like_original,
     looks_like_pickup_group_label,
     looks_like_time_in_label,
     looks_like_time_out_label,
+    matches_datetime_value,
     parse_user_input,
 )
 
@@ -195,3 +198,44 @@ class TestLabelClassifiers:
     ])
     def test_pickup_group_labels(self, label):
         assert looks_like_pickup_group_label(label)
+
+
+class TestSameValueMatching:
+    def test_extract_time_basic(self):
+        assert extract_time_hm("06/24 19:39") == (19, 39)
+        assert extract_time_hm("19:39") == (19, 39)
+        assert extract_time_hm("2:23 PM") == (14, 23)
+        assert extract_time_hm("12:05 AM") == (0, 5)
+        assert extract_time_hm("06/24/2026") is None
+
+    def test_extract_date_basic(self):
+        assert extract_date_md("06/24 19:39") == (6, 24)
+        assert extract_date_md("06/24/2026 19:39") == (6, 24)
+        assert extract_date_md("19:39") is None
+        # Phone-number-ish garbage must not parse as a date
+        assert extract_date_md("(555)123-1234") is None
+
+    def test_ps5398a_dep_sealed_date_trio(self):
+        # The PS Form 5398-A case: Actual Dep., Time Sealed and Date all
+        # carry the same moment in three different shapes.
+        dep = "06/24 19:39"
+        assert matches_datetime_value(dep, "06/24 19:39")        # Time Sealed
+        assert matches_datetime_value(dep, "06/24/2026 19:39")   # Date
+        assert not matches_datetime_value(dep, "06/24 20:30")    # Sched Dep
+        assert not matches_datetime_value(dep, "06/25 06:50")    # Sched Arr
+
+    def test_bare_time_matches_dated_twin(self):
+        assert matches_datetime_value("19:39", "06/24 19:39")
+        assert matches_datetime_value("19:39", "06/24/2026 19:39")
+        assert not matches_datetime_value("19:39", "06/24 19:40")
+
+    def test_same_time_different_date_does_not_match(self):
+        assert not matches_datetime_value("06/24 19:39", "06/25 19:39")
+
+    def test_date_only_matches_date_only_twin(self):
+        assert matches_datetime_value("06/24/2026", "06/24/26")
+        # ...but never a timed field that merely shares the date
+        assert not matches_datetime_value("06/24/2026", "06/24 20:30")
+
+    def test_ampm_normalisation(self):
+        assert matches_datetime_value("7:39 PM", "19:39")
